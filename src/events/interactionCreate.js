@@ -1,407 +1,291 @@
-import { Events, MessageFlags } from 'discord.js';
-import { logger } from '../utils/logger.js';
-import { getGuildConfig } from '../services/guildConfig.js';
-import { handleApplicationModal } from '../commands/Community/apply.js';
-import { handleApplicationReviewModal } from '../commands/Community/app-admin.js';
-import { handleInteractionError, createError, ErrorTypes } from '../utils/errorHandler.js';
-import { MessageTemplates } from '../utils/messageTemplates.js';
-import { InteractionHelper } from '../utils/interactionHelper.js';
-import { createInteractionTraceContext, runWithTraceContext } from '../utils/traceContext.js';
-import { validateChatInputPayloadOrThrow } from '../utils/commandInputValidation.js';
-import { enforceAbuseProtection, formatCooldownDuration } from '../utils/abuseProtection.js';
+const { EmbedBuilder } = require('discord.js');
+const shiva = require('../shiva');
 
-function withTraceContext(context = {}, traceContext = {}) {
-  return {
-    traceId: traceContext.traceId,
-    guildId: context.guildId || traceContext.guildId,
-    userId: context.userId || traceContext.userId,
-    command: context.commandName || traceContext.command,
-    ...context
-  };
-}
-
-export default {
-  name: Events.InteractionCreate,
-  async execute(interaction, client) {
-    const interactionTraceContext = createInteractionTraceContext(interaction);
-    interaction.traceContext = interactionTraceContext;
-    interaction.traceId = interactionTraceContext.traceId;
-
-    return runWithTraceContext(interactionTraceContext, async () => {
-      try {
-        InteractionHelper.patchInteractionResponses(interaction);
-
+module.exports = {
+    name: 'interactionCreate',
+    async execute(interaction, client) {
         if (interaction.isChatInputCommand()) {
-          try {
-            logger.info(`Command executed: /${interaction.commandName} by ${interaction.user.tag}`, {
-              event: 'interaction.command.received',
-              traceId: interactionTraceContext.traceId,
-              guildId: interaction.guildId,
-              userId: interaction.user?.id,
-              command: interaction.commandName
-            });
-
-            validateChatInputPayloadOrThrow(interaction, withTraceContext({
-              type: 'command_input_validation',
-              commandName: interaction.commandName
-            }, interactionTraceContext));
-
-            const command = client.commands.get(interaction.commandName);
-
+            const command = client.slashCommands.get(interaction.commandName);
+            
             if (!command) {
-              throw createError(
-                `No command matching ${interaction.commandName} was found.`,
-                ErrorTypes.CONFIGURATION,
-                'Sorry, that command does not exist.',
-                withTraceContext({ commandName: interaction.commandName }, interactionTraceContext)
-              );
+                return interaction.reply({
+                    content: 'This command is not available!',
+                    ephemeral: true
+                });
             }
 
-            const abuseProtection = await enforceAbuseProtection(interaction, command, interaction.commandName);
-            if (!abuseProtection.allowed) {
-              const formattedCooldown = formatCooldownDuration(abuseProtection.remainingMs);
-              throw createError(
-                `Risky command cooldown active for ${interaction.commandName}`,
-                ErrorTypes.RATE_LIMIT,
-                `This command is on cooldown. Please wait ${formattedCooldown} before trying again.`,
-                withTraceContext({
-                  commandName: interaction.commandName,
-                  subtype: 'command_cooldown',
-                  expected: true,
-                  cooldownMs: abuseProtection.remainingMs,
-                  cooldownWindowMs: abuseProtection.policy?.windowMs,
-                  cooldownMaxAttempts: abuseProtection.policy?.maxAttempts
-                }, interactionTraceContext)
-              );
+            if (!shiva || !shiva.validateCore || !shiva.validateCore()) {
+                const embed = new EmbedBuilder()
+                    .setDescription('❌ System core offline - Commands unavailable')
+                    .setColor('#FF0000');
+                return interaction.reply({ embeds: [embed], ephemeral: true }).catch(() => {});
             }
 
-            let guildConfig = null;
-            if (interaction.guild) {
-              guildConfig = await getGuildConfig(client, interaction.guild.id, interactionTraceContext);
-              if (guildConfig?.disabledCommands?.[interaction.commandName]) {
-                throw createError(
-                  `Command ${interaction.commandName} is disabled in this guild`,
-                  ErrorTypes.CONFIGURATION,
-                  'This command has been disabled for this server.',
-                  withTraceContext({ commandName: interaction.commandName, guildId: interaction.guild.id }, interactionTraceContext)
-                );
-              }
+            if (!command.securityToken || command.securityToken !== shiva.SECURITY_TOKEN) {
+                
+                const securityEmbed = new EmbedBuilder()
+                    .setDescription('❌ Command blocked - Security validation required')
+                    .setColor('#FF6600');
+                
+                return interaction.reply({ embeds: [securityEmbed], ephemeral: true }).catch(() => {});
             }
 
-            await command.execute(interaction, guildConfig, client);
-          } catch (error) {
-            await handleInteractionError(interaction, error, withTraceContext({
-              type: 'command',
-              commandName: interaction.commandName
-            }, interactionTraceContext));
-          }
-        } else if (interaction.isAutocomplete()) {
-          // Handle autocomplete interactions
-          const focusedOption = interaction.options.getFocused(true);
-          
-          if (interaction.commandName === 'apply' && focusedOption.name === 'application') {
             try {
-              const { getApplicationRoles } = await import('../utils/database.js');
-              const roles = await getApplicationRoles(client, interaction.guildId);
-              const roleName = interaction.options.getString('application', false);
+                await command.execute(interaction, client);
+
+                if (!interaction.shivaValidated || !interaction.securityToken || interaction.securityToken !== shiva.SECURITY_TOKEN) {
+                  
+                    const warningEmbed = new EmbedBuilder()
+                        .setDescription('⚠️ Security anomaly detected - Command execution logged')
+                        .setColor('#FF6600');
+                    
+                    if (!interaction.replied && !interaction.deferred) {
+                        await interaction.reply({ embeds: [warningEmbed], ephemeral: true }).catch(() => {});
+                    }
+                    return;
+                }
+
               
-              // Filter: only show enabled applications
-              const filtered = roles.filter(role =>
-                role.enabled !== false && 
-                role.name.toLowerCase().startsWith(roleName?.toLowerCase() || '')
-              );
-              
-              await interaction.respond(
-                filtered.slice(0, 25).map(role => ({
-                  name: `${role.name}${role.enabled === false ? ' (disabled)' : ''}`,
-                  value: role.name
-                }))
-              );
+
             } catch (error) {
-              logger.error('Error handling autocomplete:', {
-                error: error.message,
-                guildId: interaction.guildId,
-                commandName: interaction.commandName
-              });
-              await interaction.respond([]);
-            }
-          } else if (interaction.commandName === 'app-admin' && focusedOption.name === 'application') {
-            try {
-              const { getApplicationRoles } = await import('../utils/database.js');
-              const roles = await getApplicationRoles(client, interaction.guildId);
-              const appName = interaction.options.getString('application', false);
-              
-              // Show all applications (enabled and disabled), but mark disabled ones
-              const filtered = roles.filter(role =>
-                role.name.toLowerCase().startsWith(appName?.toLowerCase() || '')
-              );
-              
-              await interaction.respond(
-                filtered.slice(0, 25).map(role => ({
-                  name: `${role.name}${role.enabled === false ? ' (disabled)' : ''}`,
-                  value: role.name
-                }))
-              );
-            } catch (error) {
-              logger.error('Error handling app-admin autocomplete:', {
-                error: error.message,
-                guildId: interaction.guildId,
-                commandName: interaction.commandName
-              });
-              await interaction.respond([]);
-            }
-          } else if (interaction.commandName === 'reactroles' && focusedOption.name === 'panel') {
-            try {
-              const { getAllReactionRoleMessages, deleteReactionRoleMessage } = await import('../services/reactionRoleService.js');
-              const guildId = interaction.guildId;
-              const guild = interaction.guild;
-              
-              let panels = await getAllReactionRoleMessages(client, guildId);
-              
-              if (!panels || panels.length === 0) {
-                await interaction.respond([]);
-                return;
-              }
-              
-              // Filter out panels whose messages no longer exist
-              const validPanels = [];
-              for (const panel of panels) {
-                if (!panel.messageId || !panel.channelId) {
-                  continue;
+                console.error('Error executing slash command:', error);
+                
+                if (error.message.includes('shiva') || error.message.includes('validateCore')) {
+                    const securityEmbed = new EmbedBuilder()
+                        .setDescription('❌ System security modules offline - Commands unavailable')
+                        .setColor('#FF0000');
+                    
+                    const reply = { embeds: [securityEmbed], ephemeral: true };
+                    
+                    if (interaction.replied || interaction.deferred) {
+                        await interaction.followUp(reply).catch(() => {});
+                    } else {
+                        await interaction.reply(reply).catch(() => {});
+                    }
+                    return;
                 }
                 
-                const channel = guild.channels.cache.get(panel.channelId);
-                if (!channel) {
-                  await deleteReactionRoleMessage(client, guildId, panel.messageId).catch(() => {});
-                  continue;
-                }
+                const reply = {
+                    content: 'There was an error executing this command!',
+                    ephemeral: true
+                };
                 
-                const msg = await channel.messages.fetch(panel.messageId).catch(() => null);
-                if (!msg) {
-                  await deleteReactionRoleMessage(client, guildId, panel.messageId).catch(() => {});
-                  continue;
+                if (interaction.replied || interaction.deferred) {
+                    await interaction.followUp(reply);
+                } else {
+                    await interaction.reply(reply);
                 }
-                validPanels.push(panel);
-              }
-              
-              if (validPanels.length === 0) {
-                await interaction.respond([]);
-                return;
-              }
-              
-              const choices = await Promise.all(
-                validPanels.slice(0, 25).map(async panel => {
-                  try {
-                    const channel = guild.channels.cache.get(panel.channelId);
-                    if (!channel) return null;
-                    
-                    const msg = await channel.messages.fetch(panel.messageId).catch(() => null);
-                    if (!msg) return null;
-                    
-                    const title = msg?.embeds?.[0]?.title ?? 'Untitled Panel';
-                    const channelName = channel?.name ?? 'unknown';
-                    
-                    return {
-                      name: `${title} (${channelName})`.substring(0, 100),
-                      value: panel.messageId
-                    };
-                  } catch (e) {
-                    return null;
-                  }
-                })
-              );
-              
-              const validChoices = choices.filter(c => c !== null);
-              await interaction.respond(validChoices);
-            } catch (error) {
-              logger.error('Error handling reactroles autocomplete:', {
-                error: error.message,
-                guildId: interaction.guildId,
-                commandName: interaction.commandName
-              });
-              await interaction.respond([]);
             }
-          }
-        } else if (interaction.isButton()) {
-          if (interaction.customId.startsWith('shared_todo_')) {
-            const parts = interaction.customId.split('_');
-            const buttonType = parts.slice(0, 3).join('_');
-            const listId = parts[3];
-            const button = client.buttons.get(buttonType);
-
-            if (button) {
-              try {
-                await button.execute(interaction, client, [listId]);
-              } catch (error) {
-                await handleInteractionError(interaction, error, withTraceContext({
-                  type: 'button',
-                  customId: interaction.customId,
-                  handler: 'todo'
-                }, interactionTraceContext));
-              }
-            } else {
-              throw createError(
-                `No button handler found for ${buttonType}`,
-                ErrorTypes.CONFIGURATION,
-                'This button is not available.',
-                withTraceContext({ buttonType }, interactionTraceContext)
-              );
-            }
-            return;
-          }
-
-          const [customId, ...args] = interaction.customId.split(':');
-          const button = client.buttons.get(customId);
-
-          if (!button) {
-            if (!interaction.customId.includes(':')) {
-              return;
-            }
-
-            throw createError(
-              `No button handler found for ${customId}`,
-              ErrorTypes.CONFIGURATION,
-              'This button is not available.',
-              withTraceContext({ customId }, interactionTraceContext)
-            );
-          }
-
-          try {
-            await button.execute(interaction, client, args);
-          } catch (error) {
-            await handleInteractionError(interaction, error, withTraceContext({
-              type: 'button',
-              customId: interaction.customId,
-              handler: 'general'
-            }, interactionTraceContext));
-          }
-        } else if (interaction.isStringSelectMenu()) {
-          const [customId, ...args] = interaction.customId.split(':');
-          const selectMenu = client.selectMenus.get(customId);
-
-          if (!selectMenu) {
-            if (!interaction.customId.includes(':')) {
-              // No registered handler and no ':' delimiter — this is an inline-collected
-              // select menu (e.g. ticket_config_<guildId>, jointocreate_config_<id>).
-              // Return silently so the existing MessageComponentCollector handles it.
-              return;
-            }
-
-            throw createError(
-              `No select menu handler found for ${customId}`,
-              ErrorTypes.CONFIGURATION,
-              'This select menu is not available.',
-              withTraceContext({ customId }, interactionTraceContext)
-            );
-          }
-
-          try {
-            await selectMenu.execute(interaction, client, args);
-          } catch (error) {
-            await handleInteractionError(interaction, error, withTraceContext({
-              type: 'select_menu',
-              customId: interaction.customId
-            }, interactionTraceContext));
-          }
-        } else if (interaction.isModalSubmit()) {
-          if (interaction.customId.startsWith('app_modal_')) {
-            try {
-              await handleApplicationModal(interaction);
-            } catch (error) {
-              await handleInteractionError(interaction, error, withTraceContext({
-                type: 'modal',
-                customId: interaction.customId,
-                handler: 'application'
-              }, interactionTraceContext));
-            }
-            return;
-          }
-
-          if (interaction.customId.startsWith('app_review_')) {
-            try {
-              await handleApplicationReviewModal(interaction);
-            } catch (error) {
-              await handleInteractionError(interaction, error, withTraceContext({
-                type: 'modal',
-                customId: interaction.customId,
-                handler: 'application_review'
-              }, interactionTraceContext));
-            }
-            return;
-          }
-
-          if (interaction.customId.startsWith('jtc_')) {
-            logger.debug(`Skipping modal handler lookup for inline-awaited modal: ${interaction.customId}`, {
-              event: 'interaction.modal.inline_skipped',
-              traceId: interactionTraceContext.traceId
-            });
-            return;
-          }
-
-          const [customId, ...args] = interaction.customId.split(':');
-          const modal = client.modals.get(customId);
-
-          if (!modal) {
-            if (!interaction.customId.includes(':')) {
-              // No registered handler and no ':' delimiter — this is an inline-awaited
-              // modal (e.g. via awaitModalSubmit). Return silently so the caller handles it.
-              return;
-            }
-
-            throw createError(
-              `No modal handler found for ${customId}`,
-              ErrorTypes.CONFIGURATION,
-              'This form is not available.',
-              withTraceContext({ customId }, interactionTraceContext)
-            );
-          }
-
-          try {
-            await modal.execute(interaction, client, args);
-          } catch (error) {
-            await handleInteractionError(interaction, error, withTraceContext({
-              type: 'modal',
-              customId: interaction.customId,
-              handler: 'general'
-            }, interactionTraceContext));
-          }
         }
-      } catch (error) {
-        logger.error('Unhandled error in interactionCreate:', {
-          event: 'interaction.unhandled_error',
-          errorCode: 'INTERACTION_UNHANDLED_ERROR',
-          error,
-          traceId: interactionTraceContext.traceId,
-          interactionId: interaction.id,
-          guildId: interaction.guildId,
-          userId: interaction.user?.id
-        });
-
-        try {
-          const ephemeralErrorMessage = {
-            embeds: [MessageTemplates.ERRORS.DATABASE_ERROR('processing your interaction')],
-            flags: MessageFlags.Ephemeral
-          };
-          const editErrorMessage = {
-            embeds: [MessageTemplates.ERRORS.DATABASE_ERROR('processing your interaction')]
-          };
-
-          if (interaction.deferred) {
-            await interaction.editReply(editErrorMessage);
-          } else if (interaction.replied) {
-            await interaction.followUp(ephemeralErrorMessage);
-          } else {
-            await interaction.reply(ephemeralErrorMessage);
-          }
-        } catch (replyError) {
-          logger.error('Failed to send fallback error response:', {
-            event: 'interaction.error_response_failed',
-            errorCode: 'INTERACTION_ERROR_RESPONSE_FAILED',
-            error: replyError,
-            traceId: interactionTraceContext.traceId
-          });
+        
+        else if (interaction.isButton()) {
+            await handleSecureMusicButton(interaction, client);
         }
-      }
-    });
-  }
+    }
 };
+
+async function handleSecureMusicButton(interaction, client) {
+    if (interaction.customId === 'music_support') return;
+    
+    const ConditionChecker = require('../utils/checks');
+    const checker = new ConditionChecker(client);
+    
+    try {
+        const conditions = await checker.checkMusicConditions(
+            interaction.guild.id,
+            interaction.user.id,
+            interaction.member.voice?.channelId,
+            true 
+        );
+
+        if (!conditions.hasActivePlayer) {
+            return interaction.reply({
+                content: '❌ No music is currently playing!',
+                ephemeral: true
+            });
+        }
+
+        if (!conditions.userInVoice) {
+            return interaction.reply({
+                content: '❌ You need to be in a voice channel to control music!',
+                ephemeral: true
+            });
+        }
+
+        if (!conditions.sameVoiceChannel) {
+            const botChannelName = interaction.guild.channels.cache.get(conditions.botVoiceChannel)?.name || 'Unknown';
+            return interaction.reply({
+                content: `❌ You need to be in **${botChannelName}** voice channel to control music!`,
+                ephemeral: true
+            });
+        }
+
+
+        const canUseMusic = await checker.canUseMusic(interaction.guild.id, interaction.user.id);
+        if (!canUseMusic) {
+            return interaction.reply({
+                content: '❌ You need DJ permissions to control music!',
+                ephemeral: true
+            });
+        }
+
+
+        const player = conditions.player;
+        const action = interaction.customId.replace('music_', '');
+        const CentralEmbedHandler = require('../utils/centralEmbed');
+        const centralHandler = new CentralEmbedHandler(client);
+        
+        switch (action) {
+            case 'pause':
+                player.pause(true);
+                await interaction.reply({
+                    content: '⏸️ Music paused',
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'resume':
+                player.pause(false);
+                await interaction.reply({
+                    content: '▶️ Music resumed',
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'skip':
+                const currentTrack = player.current?.info?.title || 'Unknown';
+                player.stop();
+                await interaction.reply({
+                    content: `⏭️ Skipped: \`${currentTrack}\``,
+                    ephemeral: true
+                });
+                break;
+                
+            case 'stop':
+                player.destroy();
+                await interaction.reply({
+                    content: '🛑 Music stopped and disconnected',
+                    ephemeral: true
+                });
+                break;
+                
+            case 'clear':
+                const clearedCount = player.queue.size;
+                player.queue.clear();
+                await interaction.reply({
+                    content: `🗑️ Cleared ${clearedCount} songs from queue`,
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'loop':
+                const currentLoop = player.loop || 'none';
+                let newLoop;
+                
+                switch (currentLoop) {
+                    case 'none': newLoop = 'track'; break;
+                    case 'track': newLoop = 'queue'; break;
+                    case 'queue': newLoop = 'none'; break;
+                    default: newLoop = 'track';
+                }
+                
+                player.setLoop(newLoop);
+                const loopEmojis = { none: '➡️', track: '🔂', queue: '🔁' };
+                await interaction.reply({
+                    content: `${loopEmojis[newLoop]} Loop mode: **${newLoop}**`,
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'volume_up':
+                const newVolumeUp = Math.min(player.volume + 10, 100);
+                player.setVolume(newVolumeUp);
+                await interaction.reply({
+                    content: `🔊 Volume increased to ${newVolumeUp}%`,
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'volume_down':
+                const newVolumeDown = Math.max(player.volume - 10, 1);
+                player.setVolume(newVolumeDown);
+                await interaction.reply({
+                    content: `🔉 Volume decreased to ${newVolumeDown}%`,
+                    ephemeral: true
+                });
+                await updateCentralEmbed();
+                break;
+                
+            case 'queue':
+                if (player.queue.size === 0) {
+                    return interaction.reply({
+                        content: '📜 Queue is empty',
+                        ephemeral: true
+                    });
+                }
+                
+                const queueList = player.queue.map((track, index) => 
+                    `\`${index + 1}.\` ${track.info.title.substring(0, 40)}${track.info.title.length > 40 ? '...' : ''}`
+                ).slice(0, 10).join('\n');
+                
+                const moreText = player.queue.size > 10 ? `\n... and ${player.queue.size - 10} more songs` : '';
+                
+                await interaction.reply({
+                    content: `📜 **Queue (${player.queue.size} songs)**\n${queueList}${moreText}`,
+                    ephemeral: true
+                });
+                break;
+                
+            case 'shuffle':
+                if (player.queue.size === 0) {
+                    return interaction.reply({
+                        content: '❌ Queue is empty, nothing to shuffle!',
+                        ephemeral: true
+                    });
+                }
+                
+                player.queue.shuffle();
+                await interaction.reply({
+                    content: `🔀 Shuffled ${player.queue.size} songs in queue`,
+                    ephemeral: true
+                });
+                break;
+                
+            default:
+                await interaction.reply({
+                    content: '❌ Unknown button action',
+                    ephemeral: true
+                });
+        }
+
+
+        async function updateCentralEmbed() {
+            if (player && player.current) {
+                const playerInfo = {
+                    title: player.current.info.title,
+                    author: player.current.info.author,
+                    duration: player.current.info.length,
+                    thumbnail: player.current.info.thumbnail,
+                    requester: player.current.info.requester,
+                    paused: player.paused,
+                    volume: player.volume,
+                    loop: player.loop,
+                    queueLength: player.queue.size
+                };
+                await centralHandler.updateCentralEmbed(interaction.guild.id, playerInfo);
+            }
+        }
+
+    } catch (error) {
+        console.error('Error handling secure music button:', error);
+        await interaction.reply({
+            content: '❌ An error occurred while processing your request',
+            ephemeral: true
+        }).catch(() => {});
+    }
+}
